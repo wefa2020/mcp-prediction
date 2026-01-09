@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# Environment variables
+.env
+.env.local
+
+# AWS credentials (NEVER commit these!)
+*.pem
+credentials
+config
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build
+build/
+dist/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# model 
+trained_model/
+
+# Large model files
+sagemaker/model_package/
+sagemaker/model.tar.gz
+*.pt
+*.pkl
+*.pth
+*.tar.gz
+model.tar.gz
+best_model.pt

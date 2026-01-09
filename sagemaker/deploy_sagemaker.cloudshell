@@ -1,0 +1,107 @@
+cat > deploy.py << 'SCRIPT'
+import boto3, time, sys
+from datetime import datetime
+
+MODEL = "s3://sagemaker-us-east-1-178173414069/package-lifecycle-event-predicition_model/model.tar.gz"
+ROLE = "arn:aws:iam::178173414069:role/service-role/AmazonSageMaker-ExecutionRole-20250922T120340"
+ENDPOINT = "mcp-package-lifecycle-predictor"
+INSTANCE = "ml.g4dn.xlarge"
+REGION = "us-east-1"
+IMAGE = "763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-inference:2.1.0-gpu-py310-cu118-ubuntu20.04-sagemaker"
+
+sm = boto3.client("sagemaker", region_name=REGION)
+ts = datetime.now().strftime("%Y%m%d%H%M%S")
+model_name = f"{ENDPOINT}-model-{ts}"
+config_name = f"{ENDPOINT}-config-{ts}"
+
+print("="*60)
+print("DEPLOYING SAGEMAKER ENDPOINT")
+print("="*60)
+print(f"Model: {MODEL}")
+print(f"Endpoint: {ENDPOINT}")
+print(f"Instance: {INSTANCE}")
+print("="*60)
+
+print(f"\n[1/4] Creating model: {model_name}")
+sm.create_model(
+    ModelName=model_name,
+    PrimaryContainer={
+        "Image": IMAGE,
+        "ModelDataUrl": MODEL,
+        "Environment": {
+            "SAGEMAKER_PROGRAM": "inference.py",
+            "SAGEMAKER_SUBMIT_DIRECTORY": MODEL
+        }
+    },
+    ExecutionRoleArn=ROLE
+)
+print("      ✓ Model created")
+
+print(f"\n[2/4] Creating endpoint config: {config_name}")
+sm.create_endpoint_config(
+    EndpointConfigName=config_name,
+    ProductionVariants=[{
+        "VariantName": "primary",
+        "ModelName": model_name,
+        "InitialInstanceCount": 1,
+        "InstanceType": INSTANCE,
+        "InitialVariantWeight": 1.0
+    }]
+)
+print("      ✓ Config created")
+
+print(f"\n[3/4] Creating endpoint: {ENDPOINT}")
+try:
+    sm.describe_endpoint(EndpointName=ENDPOINT)
+    print("      Updating existing endpoint...")
+    sm.update_endpoint(EndpointName=ENDPOINT, EndpointConfigName=config_name)
+except:
+    print("      Creating new endpoint...")
+    sm.create_endpoint(EndpointName=ENDPOINT, EndpointConfigName=config_name)
+print("      ✓ Endpoint deployment started")
+
+print(f"\n[4/4] Waiting for endpoint to be ready (5-10 minutes)...")
+start = time.time()
+while True:
+    resp = sm.describe_endpoint(EndpointName=ENDPOINT)
+    status = resp["EndpointStatus"]
+    elapsed = int(time.time() - start)
+    mins, secs = elapsed // 60, elapsed % 60
+    print(f"      [{mins:02d}:{secs:02d}] Status: {status}")
+    
+    if status == "InService":
+        print("\n" + "="*60)
+        print("✓ SUCCESS! ENDPOINT IS READY")
+        print("="*60)
+        print(f"Endpoint Name: {ENDPOINT}")
+        break
+    elif status == "Failed":
+        print(f"\n✗ FAILED: {resp.get('FailureReason', 'Unknown')}")
+        sys.exit(1)
+    elif elapsed > 900:
+        print("\n✗ TIMEOUT")
+        sys.exit(1)
+    
+    time.sleep(30)
+SCRIPT
+
+python3 deploy.py
+
+########
+test
+########
+
+python3 << 'EOF'
+import boto3, json
+
+runtime = boto3.client("sagemaker-runtime", region_name="us-east-1")
+
+response = runtime.invoke_endpoint(
+    EndpointName="mcp-package-lifecycle-predictor",
+    ContentType="application/json",
+    Body=json.dumps({"action": "health"})
+)
+
+result = json.loads(response["Body"].read().decode())
+print(json.dumps(result, indent=2))
+EOF

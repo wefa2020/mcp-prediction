@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: MCP Server with Neptune access
+
+Parameters:
+  SageMakerEndpointName:
+    Type: String
+    Default: mcp-package-lifecycle-predictor
+    Description: SageMaker endpoint name
+  
+  NeptuneEndpoint:
+    Type: String
+    Description: Neptune cluster endpoint (host:port)
+  
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID
+  
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnet IDs for Lambda
+  
+  NeptuneSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group that can access Neptune
+
+Globals:
+  Function:
+    Timeout: 300
+    MemorySize: 2024
+    Runtime: python3.10
+
+Resources:
+  # Security Group for Lambda
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for MCP Lambda
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # Allow Lambda to access Neptune
+  NeptuneIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NeptuneSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 8182
+      ToPort: 8182
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  # Lambda Function
+  MCPServerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: mcp-package-lifecycle-predictor-server
+      CodeUri: src/
+      Handler: lambda_handler.lambda_handler
+      Description: MCP Server with Neptune access
+      Environment:
+        Variables:
+          SAGEMAKER_ENDPOINT_NAME: !Ref SageMakerEndpointName
+          NEPTUNE_ENDPOINT: !Ref NeptuneEndpoint
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Ref SubnetIds
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - sagemaker:InvokeEndpoint
+              Resource: !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${SageMakerEndpointName}'
+            - Effect: Allow
+              Action:
+                - neptune-db:*
+              Resource: '*'
+        - VPCAccessPolicy: {}
+      Events:
+        MCPApi:
+          Type: Api
+          Properties:
+            Path: /mcp
+            Method: POST
+            RestApiId: !Ref MCPApi
+        MCPApiOptions:
+          Type: Api
+          Properties:
+            Path: /mcp
+            Method: OPTIONS
+            RestApiId: !Ref MCPApi
+
+  # API Gateway
+  MCPApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: mcp-eta-api
+      StageName: prod
+      Cors:
+        AllowMethods: "'POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+
+  # CloudWatch Logs
+  MCPServerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${MCPServerFunction}'
+      RetentionInDays: 14
+
+Outputs:
+  MCPApiEndpoint:
+    Description: MCP API Endpoint URL
+    Value: !Sub 'https://${MCPApi}.execute-api.${AWS::Region}.amazonaws.com/prod/mcp'
+    Export:
+      Name: MCPApiEndpoint
+
+  LambdaFunctionArn:
+    Description: Lambda Function ARN
+    Value: !GetAtt MCPServerFunction.Arn
