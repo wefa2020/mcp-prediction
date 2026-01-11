@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 class NeptuneClient:
-    """Client for Neptune database operations."""
+    """Client for Neptune database operations with auto-reconnect."""
     
     def __init__(self, endpoint: str, allow_undelivered: bool = True):
         """
@@ -28,12 +28,22 @@ class NeptuneClient:
         self.endpoint = endpoint
         self.allow_undelivered = allow_undelivered
         self._client = None
+        self._max_retries = 3
+        self._retry_delay = 0.5
         self._connect()
     
     def _connect(self):
         """Establish connection to Neptune."""
         connect_start = time.time()
         logger.info(f"[NEPTUNE] Connecting to Neptune at {self.endpoint}")
+        
+        # Close existing connection if any
+        if self._client:
+            try:
+                self._client.close()
+            except:
+                pass
+            self._client = None
         
         try:
             self._client = client.Client(
@@ -51,19 +61,83 @@ class NeptuneClient:
             
         except Exception as e:
             logger.error(f"[NEPTUNE] Failed to connect: {type(e).__name__}: {e}")
+            self._client = None
             raise
     
+    def _reconnect(self):
+        """Force reconnection to Neptune."""
+        logger.warning("[NEPTUNE] Reconnecting...")
+        self._connect()
+    
+    def _is_connection_error(self, error: Exception) -> bool:
+        """Check if error is a connection-related error."""
+        error_str = str(error).lower()
+        connection_errors = [
+            "connection was already closed",
+            "connection closed",
+            "connection reset",
+            "connection refused",
+            "broken pipe",
+            "timed out",
+            "timeout",
+            "websocket",
+            "socket",
+        ]
+        return any(err in error_str for err in connection_errors)
+    
     def _execute_query(self, query: str) -> List[Any]:
-        """Execute a Gremlin query and return results."""
-        try:
-            result = self._client.submit(query).all().result()
-            return result
-        except GremlinServerError as e:
-            logger.error(f"[NEPTUNE] Gremlin error: {e}")
-            raise
-        except Exception as e:
-            logger.error(f"[NEPTUNE] Query error: {type(e).__name__}: {e}")
-            raise
+        """Execute a Gremlin query with retry logic."""
+        last_error = None
+        
+        for attempt in range(self._max_retries):
+            try:
+                if self._client is None:
+                    self._reconnect()
+                
+                result = self._client.submit(query).all().result()
+                return result
+                
+            except (RuntimeError, ConnectionError, OSError) as e:
+                last_error = e
+                logger.warning(f"[NEPTUNE] Query attempt {attempt + 1}/{self._max_retries} failed: {type(e).__name__}: {e}")
+                
+                if self._is_connection_error(e):
+                    # Connection issue - try to reconnect
+                    try:
+                        self._reconnect()
+                    except Exception as reconnect_error:
+                        logger.error(f"[NEPTUNE] Reconnect failed: {reconnect_error}")
+                    
+                    if attempt < self._max_retries - 1:
+                        sleep_time = self._retry_delay * (attempt + 1)
+                        logger.info(f"[NEPTUNE] Waiting {sleep_time}s before retry...")
+                        time.sleep(sleep_time)
+                else:
+                    # Non-connection error - don't retry
+                    raise
+                    
+            except GremlinServerError as e:
+                logger.error(f"[NEPTUNE] Gremlin error: {e}")
+                raise
+                
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[NEPTUNE] Unexpected error on attempt {attempt + 1}: {type(e).__name__}: {e}")
+                
+                if self._is_connection_error(e):
+                    try:
+                        self._reconnect()
+                    except:
+                        pass
+                    
+                    if attempt < self._max_retries - 1:
+                        time.sleep(self._retry_delay * (attempt + 1))
+                else:
+                    raise
+        
+        # All retries exhausted
+        logger.error(f"[NEPTUNE] Query failed after {self._max_retries} attempts")
+        raise RuntimeError(f"Neptune query failed after {self._max_retries} attempts: {last_error}")
     
     def _sanitize_id(self, package_id: str) -> str:
         """Sanitize package ID for Gremlin query."""
@@ -359,6 +433,14 @@ class NeptuneClient:
             return False, "Missing DELIVERY event"
         
         return True, None
+    
+    def health_check(self) -> bool:
+        """Check if connection is healthy."""
+        try:
+            self._execute_query("g.V().limit(1).count()")
+            return True
+        except:
+            return False
     
     def close(self):
         """Close Neptune connection."""

@@ -92,17 +92,33 @@ Resources:
             Path: /mcp
             Method: OPTIONS
             RestApiId: !Ref MCPApi
+            Auth:
+              Authorizer: NONE
 
-  # API Gateway
+  # API Gateway with IAM Authentication
   MCPApi:
     Type: AWS::Serverless::Api
     Properties:
       Name: mcp-eta-api
       StageName: prod
+      Auth:
+        DefaultAuthorizer: AWS_IAM
+        AddDefaultAuthorizerToCorsPreflight: false
       Cors:
         AllowMethods: "'POST,OPTIONS'"
-        AllowHeaders: "'Content-Type,Authorization'"
+        AllowHeaders: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
         AllowOrigin: "'*'"
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
 
   # CloudWatch Logs
   MCPServerLogGroup:

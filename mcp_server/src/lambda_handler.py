@@ -160,7 +160,7 @@ def handle_call_tool(params: Dict, request_id: str) -> Dict:
                 }],
                 "isError": False
             }, request_id)
-        
+
         elif tool_name == "get_package_status":
             package_id = arguments.get("package_id")
             if not package_id:
