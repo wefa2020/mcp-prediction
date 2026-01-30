@@ -18,8 +18,21 @@ logger = logging.getLogger(__name__)
 class SkeletonBuilder:
     """Builds event skeleton from leg_plan and matches with Neptune events."""
     
+    # Default values for context fields (aligned with inference.py)
+    DEFAULT_CARRIER = 'AMZN_US'
+    DEFAULT_LEG_TYPE = 'FORWARD'
+    
     def __init__(self):
         pass
+    
+    def _safe_get(self, d: Optional[Dict], key: str, default=None):
+        """Safely get a value from dict, handling None and 'nan' strings."""
+        if d is None:
+            return default
+        val = d.get(key, default)
+        if val is None or str(val).lower() == 'nan':
+            return default
+        return val
     
     def parse_leg_plan(self, leg_plan_str: str) -> Optional[Dict]:
         """Parse leg plan JSON string."""
@@ -157,15 +170,20 @@ class SkeletonBuilder:
         for i, (sc_id, sc_data) in enumerate(sort_centers):
             is_first_sc = (i == 0)
             
+            # Use _safe_get for extracting values (handles None and 'nan')
+            plan_time = self._safe_get(sc_data, 'plan_time')
+            cpt = self._safe_get(sc_data, 'cpt')
+            ship_method = self._safe_get(sc_data, 'ship_method')
+            
             if is_first_sc:
                 # INDUCT event
                 skeleton.append({
                     'event_idx': event_idx,
                     'event_type': 'INDUCT',
                     'location': sc_id,
-                    'plan_time': sc_data.get('plan_time'),
-                    'cpt': sc_data.get('cpt'),
-                    'ship_method': sc_data.get('ship_method'),
+                    'plan_time': plan_time,
+                    'cpt': cpt,
+                    'ship_method': ship_method,
                     'is_first_event': True,
                 })
                 logger.debug(f"[SKELETON] Added INDUCT at {sc_id} (idx={event_idx})")
@@ -176,7 +194,7 @@ class SkeletonBuilder:
                     'event_idx': event_idx,
                     'event_type': 'EXIT',
                     'location': sc_id,
-                    'plan_time': sc_data.get('cpt'),
+                    'plan_time': cpt,  # EXIT plan_time = previous CPT
                     'cpt': None,
                     'ship_method': None,
                     'is_first_event': False,
@@ -189,9 +207,9 @@ class SkeletonBuilder:
                     'event_idx': event_idx,
                     'event_type': 'LINEHAUL',
                     'location': sc_id,
-                    'plan_time': sc_data.get('plan_time'),
-                    'cpt': sc_data.get('cpt'),
-                    'ship_method': sc_data.get('ship_method'),
+                    'plan_time': plan_time,
+                    'cpt': cpt,
+                    'ship_method': ship_method,
                     'is_first_event': False,
                 })
                 logger.debug(f"[SKELETON] Added LINEHAUL at {sc_id} (idx={event_idx})")
@@ -202,7 +220,7 @@ class SkeletonBuilder:
                     'event_idx': event_idx,
                     'event_type': 'EXIT',
                     'location': sc_id,
-                    'plan_time': sc_data.get('cpt'),
+                    'plan_time': cpt,  # EXIT plan_time = previous CPT
                     'cpt': None,
                     'ship_method': None,
                     'is_first_event': False,
@@ -217,8 +235,8 @@ class SkeletonBuilder:
             delivery_ship_method = None
             
             if dest_postal_entry:
-                delivery_plan_time = dest_postal_entry[1].get('plan_time')
-                delivery_ship_method = dest_postal_entry[1].get('ship_method')
+                delivery_plan_time = self._safe_get(dest_postal_entry[1], 'plan_time')
+                delivery_ship_method = self._safe_get(dest_postal_entry[1], 'ship_method')
             
             skeleton.append({
                 'event_idx': event_idx,
@@ -277,17 +295,17 @@ class SkeletonBuilder:
         
         if event_type == 'DELIVERY':
             station = event.get('delivery_station')
-            if station:
+            if station and str(station).lower() != 'nan':
                 return str(station)
             delivery_loc = event.get('delivery_location')
             if delivery_loc and isinstance(delivery_loc, dict):
                 loc_id = delivery_loc.get('id', '')
-                if loc_id:
+                if loc_id and str(loc_id).lower() != 'nan':
                     return str(loc_id)
             return ''
         else:
             sort_center = event.get('sort_center')
-            if sort_center:
+            if sort_center and str(sort_center).lower() != 'nan':
                 return str(sort_center)
             return ''
     
@@ -301,20 +319,23 @@ class SkeletonBuilder:
         """Get plan_time for an event."""
         if neptune_event:
             neptune_plan_time = neptune_event.get('plan_time')
-            if neptune_plan_time:
+            if neptune_plan_time and str(neptune_plan_time).lower() != 'nan':
                 return neptune_plan_time
         
         if event_type == 'EXIT' and event_idx > 0:
             prev_skel = skeleton[event_idx - 1]
             prev_cpt = prev_skel.get('cpt')
-            if prev_cpt:
+            if prev_cpt and str(prev_cpt).lower() != 'nan':
                 return prev_cpt
             prev_context = prev_skel.get('context', {})
             if prev_context.get('cpt'):
                 return prev_context.get('cpt')
         
         skel = skeleton[event_idx]
-        return skel.get('plan_time')
+        plan_time = skel.get('plan_time')
+        if plan_time and str(plan_time).lower() != 'nan':
+            return plan_time
+        return None
     
     def _find_delivery_event(
         self, 
@@ -436,10 +457,15 @@ class SkeletonBuilder:
                     skel_idx, skel_type, filled_skeleton, matched_event
                 )
                 
-                context = {'has_problem': False}
+                # Build context with defaults (aligned with inference.py)
+                context = {
+                    'has_problem': False,
+                    'carrier': self.DEFAULT_CARRIER,
+                    'leg_type': self.DEFAULT_LEG_TYPE,
+                }
                 
                 problem = matched_event.get('problem')
-                if problem:
+                if problem and str(problem).lower() != 'nan':
                     context['problem'] = problem
                     context['has_problem'] = True
                 
@@ -453,27 +479,27 @@ class SkeletonBuilder:
                     context['dwelling_hours'] = round(dwelling_seconds / 3600.0, 2)
                 
                 carrier = matched_event.get('carrier_id')
-                if carrier:
+                if carrier and str(carrier).lower() != 'nan':
                     context['carrier'] = carrier
                 
                 leg_type = matched_event.get('leg_type')
-                if leg_type:
+                if leg_type and str(leg_type).lower() != 'nan':
                     context['leg_type'] = leg_type
                 
                 ship_method = matched_event.get('ship_method') or skel.get('ship_method')
-                if ship_method:
+                if ship_method and str(ship_method).lower() != 'nan':
                     context['ship_method'] = ship_method
                 
                 sort_center = matched_event.get('sort_center')
-                if sort_center:
+                if sort_center and str(sort_center).lower() != 'nan':
                     context['sort_center'] = sort_center
                 
                 delivery_station = matched_event.get('delivery_station')
-                if delivery_station:
+                if delivery_station and str(delivery_station).lower() != 'nan':
                     context['delivery_station'] = delivery_station
                 
                 cpt = matched_event.get('cpt') or skel.get('cpt')
-                if cpt:
+                if cpt and str(cpt).lower() != 'nan':
                     context['cpt'] = cpt
                     skel['cpt'] = cpt
                 
@@ -489,12 +515,17 @@ class SkeletonBuilder:
                 )
                 skel['plan_time'] = plan_time
                 
-                context = {'has_problem': False}
+                # Build context with defaults for unmatched events
+                context = {
+                    'has_problem': False,
+                    'carrier': self.DEFAULT_CARRIER,
+                    'leg_type': self.DEFAULT_LEG_TYPE,
+                    'sort_center': skel['location'],
+                }
                 if skel.get('ship_method'):
                     context['ship_method'] = skel['ship_method']
                 if skel.get('cpt'):
                     context['cpt'] = skel['cpt']
-                context['sort_center'] = skel['location']
                 
                 skel['context'] = context
         
