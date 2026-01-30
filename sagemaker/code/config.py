@@ -1,178 +1,291 @@
-import os 
-import torch
-from dataclasses import dataclass, field, asdict
-from typing import List, Optional    
-from typing import Dict
+import os
+import json
+from dataclasses import dataclass, field, asdict, fields
+from typing import Dict, Any, Optional, List
+from pathlib import Path
 
 
-def get_sagemaker_paths():
-    """Get SageMaker paths if running in SageMaker"""
-    return {
-        'model_dir': os.environ.get('SM_MODEL_DIR', './model'),
-        'output_dir': os.environ.get('SM_OUTPUT_DATA_DIR', './output'),
-        'data_dir': os.environ.get('SM_CHANNEL_TRAINING', './data'),
-        'num_gpus': int(os.environ.get('SM_NUM_GPUS', torch.cuda.device_count())),
-        'num_cpus': int(os.environ.get('SM_NUM_CPUS', os.cpu_count())),
-        'hosts': os.environ.get('SM_HOSTS', '["localhost"]'),
-        'current_host': os.environ.get('SM_CURRENT_HOST', 'localhost'),
-    }
+def _load_config_json() -> Dict[str, Any]:
+    """Load config.json from the same directory as this module."""
+    config_path = Path(__file__).parent / "config.json"
+    if config_path.exists():
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    return {}
+
+
+_CONFIG_JSON = _load_config_json()
+
+
+def _get_vocab_from_json(key: str) -> List[str]:
+    """Get vocab list from config JSON, checking both root and data.vocab locations."""
+    # Check root level first (current config structure)
+    if 'vocab' in _CONFIG_JSON and key in _CONFIG_JSON['vocab']:
+        return _CONFIG_JSON['vocab'][key]
+    # Check under data.vocab (alternative structure)
+    if 'data' in _CONFIG_JSON and 'vocab' in _CONFIG_JSON.get('data', {}):
+        return _CONFIG_JSON['data']['vocab'].get(key, [])
+    return []
+
 
 @dataclass
-class NeptuneConfig:
-    """Neptune database configuration"""
-    endpoint: str = "swa-shipgraph-neptune-instance-prod-us-east-1.c6fskces27nt.us-east-1.neptune.amazonaws.com:8182"
-    use_iam: bool = False
-    region: str = "us-east-1"
+class VocabConfig:
+    """Vocabulary lists for categorical features."""
+    event_types: List[str] = field(default_factory=lambda: _get_vocab_from_json('event_types'))
+    problem_types: List[str] = field(default_factory=lambda: _get_vocab_from_json('problem_types'))
+    zip_codes: List[str] = field(default_factory=lambda: _get_vocab_from_json('zip_codes'))
+    locations: List[str] = field(default_factory=lambda: _get_vocab_from_json('locations'))
+    carriers: List[str] = field(default_factory=lambda: _get_vocab_from_json('carriers'))
+    leg_types: List[str] = field(default_factory=lambda: _get_vocab_from_json('leg_types'))
+    ship_methods: List[str] = field(default_factory=lambda: _get_vocab_from_json('ship_methods'))
+    regions: List[str] = field(default_factory=lambda: _get_vocab_from_json('regions'))
+
 
 @dataclass
 class DataConfig:
-    """Data processing configuration"""
-    # Event types in order
-    event_types: List[str] = field(default_factory=lambda: ['INDUCT', 'EXIT', 'LINEHAUL', 'DELIVERY'])
-    problem_types: List[str] = field(default_factory=lambda: [
-        'NO_PROBLEM', 'DAMAGED_LABEL', 'WRONG_NODE', 'DAMAGED_PACKAGE_REPAIRABLE', 
-        'DAMAGED_PACKAGE', 'DAMAGED_ITEM', 'CPT_EXPIRED', 'UNSUPPORTED_HAZMAT', 
-        'PARTIAL_SHIPMENT', 'EMPTY_SHIPMENT', 'VAS_PRINT_LABEL', 'COMPLETE_SHIPMENT', 
-        'CANCELLED', 'RESERVATION_EXPIRED', 'OVERWEIGHT', 'CRUSHED_BOX', 'REPACK', 
-        'HOLE_IN_BOX', 'TAPE_ISSUE', 'NO_REPACK', 'ITEMS_MISSING_FROM_BIN', 
-        'INCORRECT_DIMENSION', 'PACKAGE_OPEN', 'COMPLETE_REVERSE_SHIPMENT'
-    ])
+    """Data paths and vocabulary."""
+    cache_dir: str = "s3://graph-transformer-exp/cache"
+    source_data: str = "s3://graph-transformer-exp/data/test.json"
+    distance_file: Optional[str] = None
+    num_workers: int = 8
     
-    cache_dir: str = 'data/cache'  # Cache directory
+    # Vocabulary configuration
+    vocab: VocabConfig = field(default_factory=VocabConfig)
+    
+    @property
+    def train_h5(self) -> str:
+        return f"{self.cache_dir.rstrip('/')}/train.h5"
+    
+    @property
+    def val_h5(self) -> str:
+        return f"{self.cache_dir.rstrip('/')}/val.h5"
+    
+    @property
+    def test_h5(self) -> str:
+        return f"{self.cache_dir.rstrip('/')}/test.h5"
+    
+    @property
+    def preprocessor_path(self) -> str:
+        return f"{self.cache_dir.rstrip('/')}/preprocessor.pkl"
 
-    # Features
-    max_sequence_length: int = 20
-    time_window_days: int = 30
-    max_route_length = 20  # Adjust based on your data
 
-    # Splits
-    train_ratio: float = 0.8
-    val_ratio: float = 0.10
-    test_ratio: float = 0.10
-    
-    # Preprocessing
-    normalize_time: bool = True
-    add_positional_encoding: bool = True
-    
 @dataclass
 class ModelConfig:
-    """Model architecture configuration"""
-    
-    # === Input Dimensions ===
-    node_feature_dim: int = 256          # Total node feature dim (auto-computed)
-    edge_feature_dim: int = 64           # Total edge feature dim (auto-computed)
-    hidden_dim: int = 256                # Hidden dimension for transformer
-    
-    # === Continuous Feature Dimensions (from preprocessor) ===
-    node_continuous_dim: int = 30        # Continuous node features
-    edge_continuous_dim: int = 25        # Continuous edge features
-    
-    # === Embedding Dimensions ===
-    embed_dim: int = 32                  # Embedding dimension for each categorical feature
-    
-    # === Graph Transformer ===
-    num_layers: int = 40                 # Number of transformer layers
-    num_heads: int = 8                   # Number of attention heads
-    dropout: float = 0.1                 # Dropout rate
-    
-    # === Output ===
-    output_dim: int = 1                  # Predicting time delta
-    
-    # === Architecture Choices ===
-    use_edge_features: bool = True       # Whether to use edge features
-    use_global_attention: bool = True    # Whether to use global attention pooling
-    use_positional_encoding: bool = True # Whether to use positional encoding
-    
-    # === Categorical Feature Counts (set by preprocessor) ===
-    num_node_categorical: int = 7        # event_type, location, from_location, region, carrier, leg_type, ship_method
-    num_lookahead_categorical: int = 6   # next_event_type, next_location, next_region, next_carrier, next_leg_type, next_ship_method
-    num_edge_categorical: int = 8        # from_location, to_location, from_region, to_region, carrier_from, carrier_to, ship_method_from, ship_method_to
-    num_package_postal: int = 2          # source_postal, dest_postal
-    
-    def __post_init__(self):
-        """Compute total feature dimensions after initialization"""
-        # Node: continuous + node_cat + lookahead_cat + postal
-        node_cat_dim = self.num_node_categorical * self.embed_dim
-        lookahead_cat_dim = self.num_lookahead_categorical * self.embed_dim
-        package_postal_dim = self.num_package_postal * self.embed_dim
-        
-        self.node_feature_dim = (
-            self.node_continuous_dim +
-            node_cat_dim +
-            lookahead_cat_dim +
-            package_postal_dim
-        )
-        
-        # Edge: continuous + edge_cat
-        edge_cat_dim = self.num_edge_categorical * self.embed_dim
-        self.edge_feature_dim = self.edge_continuous_dim + edge_cat_dim
-    
-    def to_dict(self) -> Dict:
-        """Convert to dictionary for serialization"""
-        return asdict(self)
+    """Model architecture."""
+    embed_dim: int = 32
+    hidden_dim: int = 512
+    num_layers: int = 4
+    num_heads: int = 8
+    dropout: float = 0.1
+    output_dim: int = 1
+    use_edge_features: bool = True
+    time2vec_dim: int = 64
+    edge_time2vec_dim: int = 128
     
     @classmethod
-    def from_dict(cls, d: Dict) -> 'ModelConfig':
-        """Create from dictionary"""
-        valid_fields = cls.__dataclass_fields__.keys()
-        return cls(**{k: v for k, v in d.items() if k in valid_fields})
-    
-    @classmethod
-    def from_preprocessor(cls, preprocessor, **kwargs) -> 'ModelConfig':
-        """
-        Create config from fitted preprocessor
-        
-        Args:
-            preprocessor: Fitted PackageLifecyclePreprocessor
-            **kwargs: Override any config values (e.g., hidden_dim=512, num_layers=12)
-        
-        Returns:
-            ModelConfig instance
-        """
-        feature_dims = preprocessor.get_feature_dimensions()
-        
-        return cls(
-            node_continuous_dim=feature_dims['node_continuous_dim'],
-            edge_continuous_dim=feature_dims['edge_continuous_dim'],
-            num_node_categorical=feature_dims['num_node_categorical'],
-            num_lookahead_categorical=feature_dims['num_lookahead_categorical'],
-            num_edge_categorical=feature_dims['num_edge_categorical'],
-            **kwargs
-        )
-        
+    def from_dict(cls, d: Dict[str, Any]) -> 'ModelConfig':
+        """Create ModelConfig from dictionary, ignoring unknown keys."""
+        if d is None:
+            return cls()
+        # Get valid field names for this dataclass
+        valid_fields = {f.name for f in fields(cls)}
+        # Filter dictionary to only include valid fields
+        filtered = {k: v for k, v in d.items() if k in valid_fields}
+        return cls(**filtered)
+
+
 @dataclass
 class TrainingConfig:
-    """Training configuration"""
-    batch_size: int = 256
-    num_epochs: int = 100
+    """Training hyperparameters."""
+    epochs: int = 200
+    batch_size: int = 64
+    gradient_accumulation_steps: int = 1
     learning_rate: float = 1e-4
-    weight_decay: float = 1e-5
-    
-    # Scheduler
-    scheduler_type: str = "cosine"  # cosine, step, plateau
+    weight_decay: float = 0.01
+    max_grad_norm: float = 1.0
     warmup_epochs: int = 5
-    
-    # Early stopping
-    patience: int = 10
+    min_lr_ratio: float = 0.01
+    patience: int = 15
     min_delta: float = 1e-4
+    use_amp: bool = True
+    checkpoint_frequency: int = 5
+    seed: int = 42
+
+
+@dataclass
+class OutputConfig:
+    """Output paths for model artifacts."""
+    s3_output_dir: str = "s3://graph-transformer-exp/outputs"
+    save_checkpoints: bool = True
+    save_best_only: bool = False
+    log_every_n_steps: int = 10
+
+
+@dataclass
+class DistributedConfig:
+    """Distributed training."""
+    find_unused_parameters: bool = False
+
+
+def _extract_vocab_dict(d: Dict[str, Any]) -> Dict[str, List[str]]:
+    """
+    Extract vocab dictionary from config dict.
+    Checks multiple locations in order of priority:
+    1. Root level 'vocab' key
+    2. Under 'data.vocab'
+    3. Flat structure under 'data' (backward compatibility)
+    4. Falls back to _CONFIG_JSON
+    """
+    vocab_dict = {}
     
-    # Device
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    num_workers: int = 60  #cpu*2
-    
-    # Checkpointing
-    save_dir: str = "./checkpoints"
-    log_dir: str = "./logs"
-    save_every: int = 5
+    # Priority 1: Root level vocab (current config.json structure)
+    if 'vocab' in d and isinstance(d['vocab'], dict):
+        vocab_dict = d['vocab']
+     
+    return vocab_dict
+
 
 @dataclass
 class Config:
-    """Main configuration"""
-    neptune: NeptuneConfig = field(default_factory=NeptuneConfig)
+    """Main configuration."""
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    output: OutputConfig = field(default_factory=OutputConfig)
+    distributed: DistributedConfig = field(default_factory=DistributedConfig)
+    experiment_name: str = "causal_graph_transformer"
     
-    # Experiment
-    experiment_name: str = "package_event_prediction"
-    seed: int = 42
+    @property
+    def s3_experiment_dir(self) -> str:
+        return f"{self.output.s3_output_dir.rstrip('/')}/{self.experiment_name}"
+    
+    # Direct vocab access for convenience
+    @property
+    def vocab(self) -> VocabConfig:
+        """Direct access to vocab config."""
+        return self.data.vocab
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'experiment_name': self.experiment_name,
+            'vocab': {
+                'event_types': self.data.vocab.event_types,
+                'problem_types': self.data.vocab.problem_types,
+                'zip_codes': self.data.vocab.zip_codes,
+                'locations': self.data.vocab.locations,
+                'carriers': self.data.vocab.carriers,
+                'leg_types': self.data.vocab.leg_types,
+                'ship_methods': self.data.vocab.ship_methods,
+                'regions': self.data.vocab.regions,
+            },
+            'data': {
+                'cache_dir': self.data.cache_dir,
+                'source_data': self.data.source_data,
+                'distance_file': self.data.distance_file,
+                'num_workers': self.data.num_workers,
+            },
+            'model': asdict(self.model),
+            'training': asdict(self.training),
+            'output': asdict(self.output),
+            'distributed': asdict(self.distributed),
+        }
+    
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> 'Config':
+        """Create Config from dictionary, handling multiple vocab locations."""
+        data_dict = d.get('data', {})
+        vocab_dict = _extract_vocab_dict(d)
+        
+        # Build VocabConfig with fallbacks to _CONFIG_JSON
+        vocab_config = VocabConfig(
+            event_types=vocab_dict.get('event_types') or _get_vocab_from_json('event_types'),
+            problem_types=vocab_dict.get('problem_types') or _get_vocab_from_json('problem_types'),
+            zip_codes=vocab_dict.get('zip_codes') or _get_vocab_from_json('zip_codes'),
+            locations=vocab_dict.get('locations') or _get_vocab_from_json('locations'),
+            carriers=vocab_dict.get('carriers') or _get_vocab_from_json('carriers'),
+            leg_types=vocab_dict.get('leg_types') or _get_vocab_from_json('leg_types'),
+            ship_methods=vocab_dict.get('ship_methods') or _get_vocab_from_json('ship_methods'),
+            regions=vocab_dict.get('regions') or _get_vocab_from_json('regions'),
+        )
+        
+        return cls(
+            experiment_name=d.get('experiment_name', 'causal_graph_transformer'),
+            data=DataConfig(
+                cache_dir=data_dict.get('cache_dir', 's3://graph-transformer-exp/cache'),
+                source_data=data_dict.get('source_data', ''),
+                distance_file=data_dict.get('distance_file'),
+                num_workers=data_dict.get('num_workers', 8),
+                vocab=vocab_config,
+            ),
+            model=ModelConfig.from_dict(d.get('model', {})),
+            training=TrainingConfig(**{
+                k: v for k, v in d.get('training', {}).items() 
+                if k in {f.name for f in fields(TrainingConfig)}
+            }),
+            output=OutputConfig(**{
+                k: v for k, v in d.get('output', {}).items()
+                if k in {f.name for f in fields(OutputConfig)}
+            }),
+            distributed=DistributedConfig(**{
+                k: v for k, v in d.get('distributed', {}).items()
+                if k in {f.name for f in fields(DistributedConfig)}
+            }),
+        )
+    
+    def save(self, path: str):
+        """Save config to file (local or S3)."""
+        if path.startswith('s3://'):
+            import boto3
+            path_clean = path.replace('s3://', '')
+            bucket, key = path_clean.split('/', 1)
+            json_bytes = json.dumps(self.to_dict(), indent=2).encode('utf-8')
+            boto3.client('s3').put_object(Bucket=bucket, Key=key, Body=json_bytes)
+        else:
+            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+            with open(path, 'w') as f:
+                json.dump(self.to_dict(), f, indent=2)
+    
+    @classmethod
+    def load(cls, path: str) -> 'Config':
+        """Load config from file (local or S3)."""
+        if path.startswith('s3://'):
+            import boto3
+            path_parts = path.replace('s3://', '').split('/', 1)
+            bucket, key = path_parts[0], path_parts[1]
+            response = boto3.client('s3').get_object(Bucket=bucket, Key=key)
+            content = response['Body'].read().decode('utf-8')
+            return cls.from_dict(json.loads(content))
+        else:
+            with open(path, 'r') as f:
+                return cls.from_dict(json.load(f))
+    
+    def has_vocab(self) -> bool:
+        """Check if vocab is populated."""
+        v = self.data.vocab
+        return bool(v.event_types and v.locations)
+    
+    def get_vocab_sizes(self) -> Dict[str, int]:
+        """Get vocabulary sizes (including PAD and UNKNOWN tokens)."""
+        v = self.data.vocab
+        return {
+            'event_type': len(v.event_types) + 2,  # +2 for PAD, UNKNOWN
+            'location': len(v.locations) + 2,
+            'carrier': len(v.carriers) + 2,
+            'leg_type': len(v.leg_types) + 2,
+            'ship_method': len(v.ship_methods) + 2,
+            'postal': len(v.zip_codes) + 2,
+            'region': len(v.regions) + 2,
+        }
+    
+    def print_vocab_summary(self):
+        """Print a summary of loaded vocabulary."""
+        print("=== Vocabulary Summary ===")
+        v = self.data.vocab
+        print(f"  event_types: {len(v.event_types)}")
+        print(f"  problem_types: {len(v.problem_types)}")
+        print(f"  locations: {len(v.locations)}")
+        print(f"  carriers: {len(v.carriers)}")
+        print(f"  leg_types: {len(v.leg_types)}")
+        print(f"  ship_methods: {len(v.ship_methods)}")
+        print(f"  zip_codes: {len(v.zip_codes)}")
+        print(f"  regions: {len(v.regions)}")

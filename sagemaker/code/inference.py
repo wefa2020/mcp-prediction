@@ -3,11 +3,12 @@ SageMaker inference handler - PURE MODEL INFERENCE ONLY.
 Takes preprocessed features, returns predictions.
 No Neptune access - that's handled by Lambda.
 
-FIXES:
-- Removed torch.compile (causes dimension mismatch errors)
-- Fixed warmup dimensions
-- Added timeout handling
-- Added better error logging
+UPDATED: Now uses new feature structure matching data_preprocessor.py and dataset.py
+- node_observable_time, node_observable_other
+- node_realized_time, node_realized_other
+- Simplified node categorical (no from/to split)
+- Edge features (continuous only)
+- No lookahead features (model handles causality)
 """
 
 import os
@@ -15,7 +16,7 @@ import json
 import logging
 import torch
 import numpy as np
-from typing import Dict, List, Any, Union
+from typing import Dict, List, Any, Union, Optional
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ def model_fn(model_dir: str):
         logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
     
     # Import modules
-    from config import ModelConfig
+    from config import Config  # <-- Changed: Import Config, not ModelConfig
     from models.event_predictor import EventTimePredictor
     from data.data_preprocessor import PackageLifecyclePreprocessor
     
@@ -53,16 +54,28 @@ def model_fn(model_dir: str):
     preprocessor = PackageLifecyclePreprocessor.load(preprocessor_path)
     logger.info(f"Preprocessor loaded from {preprocessor_path}")
     
-    # Load model
+    # Load checkpoint
     checkpoint_path = os.path.join(model_dir, 'best_model.pt')
     logger.info(f"Loading checkpoint from {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
-    model_config = ModelConfig.from_dict(checkpoint['model_config'])
+    # Extract from checkpoint (matching working code)
     vocab_sizes = checkpoint['vocab_sizes']
+    feature_dims = checkpoint['feature_dims']  # <-- Added: Need feature_dims
     
-    model = EventTimePredictor(model_config, vocab_sizes)
-    model = model.to(device)
+    # Load FULL config (not just model config)
+    full_config = Config.from_dict(checkpoint['config'])  # <-- Changed: Use 'config' not 'model_config'
+    
+    logger.info(f"vocab_sizes: {vocab_sizes}")
+    logger.info(f"feature_dims: {feature_dims}")
+    
+    # Use from_config() method (matching working code)
+    model = EventTimePredictor.from_config(
+        config=full_config,
+        vocab_sizes=vocab_sizes,
+        feature_dims=feature_dims,
+        device=device,
+    )
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
@@ -74,10 +87,7 @@ def model_fn(model_dir: str):
     
     logger.info(f"Model loaded successfully")
     
-    # DO NOT use torch.compile - it causes dimension mismatch errors
-    # The error was: "a and b must have same reduction dim, but got [3, 586] X [662, 256]"
-    
-    # Simple CUDA warmup (no model inference)
+    # Simple CUDA warmup
     if device.type == 'cuda':
         logger.info("CUDA warmup (simple)...")
         try:
@@ -88,7 +98,6 @@ def model_fn(model_dir: str):
             logger.warning(f"CUDA warmup failed: {e}")
     
     return {'model': model, 'preprocessor': preprocessor, 'device': device}
-
 
 def input_fn(request_body: Union[str, bytes], request_content_type: str) -> Dict:
     """
@@ -189,6 +198,10 @@ def predict_fn(input_data: Dict, model_components: Dict) -> Dict:
             graph_data = graph_data.to(device)
             batch = Batch.from_data_list([graph_data])
             
+            # Add batch metadata
+            batch.node_counts = torch.tensor([graph_data.num_nodes], dtype=torch.long, device=device)
+            batch.edge_counts = torch.tensor([graph_data.edge_index.shape[1]], dtype=torch.long, device=device)
+            
             # Run inference
             logger.info(f"[{pkg_id}] Running inference...")
             with torch.no_grad():
@@ -198,19 +211,32 @@ def predict_fn(input_data: Dict, model_components: Dict) -> Dict:
             logger.info(f"[{pkg_id}] Inference complete, extracting predictions...")
             
             # Extract predictions
-            mask = batch.label_mask
-            masked_preds = predictions[mask].squeeze(-1) if predictions[mask].dim() > 1 else predictions[mask]
+            # Predictions are per-edge (transition times between consecutive events)
+            num_edges = graph_data.edge_index.shape[1]
             
-            preds_scaled = masked_preds.float().cpu().numpy()
+            if predictions.dim() > 1:
+                preds = predictions[:num_edges].squeeze(-1)
+            else:
+                preds = predictions[:num_edges]
+            
+            preds_scaled = preds.float().cpu().numpy()
             preds_hours = preprocessor.inverse_transform_time(preds_scaled).flatten()
             
-            logger.info(f"[{pkg_id}] Predictions: {preds_hours.tolist()}")
+            logger.info(f"[{pkg_id}] Predictions (hours): {preds_hours.tolist()}")
             
-            results.append({
+            # Include ground truth labels if available (for debugging)
+            result_entry = {
                 'package_id': pkg_id,
                 'status': 'success',
-                'predictions_hours': preds_hours.tolist()
-            })
+                'predictions_hours': preds_hours.tolist(),
+                'num_transitions': num_edges,
+            }
+            
+            if 'labels_raw' in features and features['labels_raw'] is not None:
+                labels_raw = features['labels_raw'].flatten()
+                result_entry['ground_truth_hours'] = labels_raw.tolist()
+            
+            results.append(result_entry)
             
         except Exception as e:
             logger.error(f"[{pkg_id}] Error: {type(e).__name__}: {e}")
@@ -230,62 +256,83 @@ def predict_fn(input_data: Dict, model_components: Dict) -> Dict:
     }
 
 
-def _features_to_pyg_data(features: Dict):
-    """Convert preprocessor features to PyG Data object."""
+def _to_tensor(arr: np.ndarray, dtype: torch.dtype) -> torch.Tensor:
+    """Convert numpy array to tensor with specified dtype."""
+    if dtype == torch.long:
+        return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.int64))
+    elif dtype == torch.float32:
+        return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32))
+    elif dtype == torch.bool:
+        return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.bool_))
+    return torch.from_numpy(arr)
+
+
+def _features_to_pyg_data(features: Dict) -> 'Data':
+    """
+    Convert preprocessor features to PyG Data object.
+    
+    Matches the structure expected by SharedMemoryCollator in dataset.py:
+    - node_observable_time, node_observable_other
+    - node_realized_time, node_realized_other  
+    - Node categorical: event_type, location, postal, region, carrier, leg_type, ship_method
+    - edge_index, edge_features
+    - package_features, source_postal_idx, dest_postal_idx
+    """
     from torch_geometric.data import Data
     
-    def to_tensor(arr, dtype):
-        if dtype == torch.long:
-            return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.int64))
-        elif dtype == torch.float32:
-            return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32))
-        elif dtype == torch.bool:
-            return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.bool_))
-        return torch.from_numpy(arr)
-    
+    # Get node categorical indices
     node_cat = features['node_categorical_indices']
-    look_cat = features['lookahead_categorical_indices']
-    edge_cat = features['edge_categorical_indices']
     pkg_cat = features['package_categorical']
     
+    num_nodes = features['num_nodes']
+    num_edges = features['edge_index'].shape[1] if features['edge_index'].size > 0 else 0
+    
+    # Build Data object matching dataset.py structure
     data = Data(
-        node_continuous=to_tensor(features['node_continuous_features'], torch.float32),
-        event_type_idx=to_tensor(node_cat['event_type'], torch.long),
-        from_location_idx=to_tensor(node_cat['from_location'], torch.long),
-        to_location_idx=to_tensor(node_cat['to_location'], torch.long),
-        to_postal_idx=to_tensor(node_cat['to_postal'], torch.long),
-        from_region_idx=to_tensor(node_cat['from_region'], torch.long),
-        to_region_idx=to_tensor(node_cat['to_region'], torch.long),
-        carrier_idx=to_tensor(node_cat['carrier'], torch.long),
-        leg_type_idx=to_tensor(node_cat['leg_type'], torch.long),
-        ship_method_idx=to_tensor(node_cat['ship_method'], torch.long),
-        next_event_type_idx=to_tensor(look_cat['next_event_type'], torch.long),
-        next_location_idx=to_tensor(look_cat['next_location'], torch.long),
-        next_postal_idx=to_tensor(look_cat['next_postal'], torch.long),
-        next_region_idx=to_tensor(look_cat['next_region'], torch.long),
-        next_carrier_idx=to_tensor(look_cat['next_carrier'], torch.long),
-        next_leg_type_idx=to_tensor(look_cat['next_leg_type'], torch.long),
-        next_ship_method_idx=to_tensor(look_cat['next_ship_method'], torch.long),
+        # === Node continuous features (Time2Vec ready) ===
+        node_observable_time=_to_tensor(features['node_observable_time'], torch.float32),
+        node_observable_other=_to_tensor(features['node_observable_other'], torch.float32),
+        node_realized_time=_to_tensor(features['node_realized_time'], torch.float32),
+        node_realized_other=_to_tensor(features['node_realized_other'], torch.float32),
+        
+        # === Node categorical indices ===
+        event_type_idx=_to_tensor(node_cat['event_type'], torch.long),
+        location_idx=_to_tensor(node_cat['location'], torch.long),
+        postal_idx=_to_tensor(node_cat['postal'], torch.long),
+        region_idx=_to_tensor(node_cat['region'], torch.long),
+        carrier_idx=_to_tensor(node_cat['carrier'], torch.long),
+        leg_type_idx=_to_tensor(node_cat['leg_type'], torch.long),
+        ship_method_idx=_to_tensor(node_cat['ship_method'], torch.long),
+        
+        # === Edge features ===
+        edge_index=_to_tensor(features['edge_index'], torch.long),
+        edge_features=_to_tensor(features['edge_features'], torch.float32),
+        
+        # === Package features ===
+        package_features=_to_tensor(
+            features['package_features'].reshape(1, -1) if features['package_features'].ndim == 1 
+            else features['package_features'], 
+            torch.float32
+        ),
         source_postal_idx=torch.tensor([pkg_cat['source_postal']], dtype=torch.long),
         dest_postal_idx=torch.tensor([pkg_cat['dest_postal']], dtype=torch.long),
-        edge_index=to_tensor(features['edge_index'], torch.long),
-        edge_continuous=to_tensor(features['edge_continuous_features'], torch.float32),
-        edge_from_location_idx=to_tensor(edge_cat['from_location'], torch.long),
-        edge_to_location_idx=to_tensor(edge_cat['to_location'], torch.long),
-        edge_to_postal_idx=to_tensor(edge_cat['to_postal'], torch.long),
-        edge_from_region_idx=to_tensor(edge_cat['from_region'], torch.long),
-        edge_to_region_idx=to_tensor(edge_cat['to_region'], torch.long),
-        edge_carrier_from_idx=to_tensor(edge_cat['carrier_from'], torch.long),
-        edge_carrier_to_idx=to_tensor(edge_cat['carrier_to'], torch.long),
-        edge_ship_method_from_idx=to_tensor(edge_cat['ship_method_from'], torch.long),
-        edge_ship_method_to_idx=to_tensor(edge_cat['ship_method_to'], torch.long),
-        num_nodes=features['num_nodes'],
+        
+        # === Metadata ===
+        num_nodes=num_nodes,
     )
     
-    if 'labels' in features:
-        data.labels = to_tensor(features['labels'].flatten(), torch.float32)
-    if 'label_mask' in features:
-        data.label_mask = to_tensor(features['label_mask'].astype(bool), torch.bool)
+    # === Labels (if available) ===
+    if 'labels' in features and features['labels'] is not None:
+        labels = features['labels']
+        if labels.ndim > 1:
+            labels = labels.flatten()
+        data.edge_labels = _to_tensor(labels, torch.float32)
+    
+    if 'labels_raw' in features and features['labels_raw'] is not None:
+        labels_raw = features['labels_raw']
+        if labels_raw.ndim > 1:
+            labels_raw = labels_raw.flatten()
+        data.edge_labels_raw = _to_tensor(labels_raw, torch.float32)
     
     return data
 
