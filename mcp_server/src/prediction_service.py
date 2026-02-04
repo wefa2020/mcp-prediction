@@ -330,15 +330,15 @@ class PredictionService:
                     pkg_result = result['results'][0]
                     
                     if pkg_result.get('status') == 'success':
-                        preds = pkg_result.get('predictions_hours', [])
+                        # NEW: Handle optimized result structure with last prediction only
+                        pred_hours = pkg_result.get('next_event_prediction_hours')
                         
-                        if preds:
-                            pred_hours = float(preds[-1])
+                        if pred_hours is not None:
                             predicted_time = self._calculate_predicted_datetime(prev_event_time, pred_hours)
                             
                             if predicted_time:
                                 predicted_times[target_idx] = predicted_time
-                                logger.debug(f"[PREDICT_ALL] Event {target_idx} ({target_skel['event_type']}): {predicted_time}")
+                                logger.debug(f"[PREDICT_ALL] Event {target_idx} ({target_skel['event_type']}): {predicted_time} (pred: {pred_hours:.2f}h)")
                             
                             next_event = dict(target_skel)
                             if target_skel.get('neptune_matched', False):

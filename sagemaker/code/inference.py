@@ -16,6 +16,8 @@ import json
 import logging
 import torch
 import numpy as np
+import multiprocessing
+import time
 from typing import Dict, List, Any, Union, Optional
 
 logging.basicConfig(level=logging.INFO)
@@ -136,13 +138,11 @@ def input_fn(request_body: Union[str, bytes], request_content_type: str) -> Dict
 
 def predict_fn(input_data: Dict, model_components: Dict) -> Dict:
     """
-    Run prediction on preprocessed package data.
+    Optimized batch prediction with parallel preprocessing and last-prediction-only results.
     """
     global model, preprocessor, device
     
     logger.info(f"predict_fn called with input keys: {list(input_data.keys())}")
-    
-    from torch_geometric.data import Data, Batch
     
     action = input_data.get('action', 'predict')
     logger.info(f"Action: {action}")
@@ -169,90 +169,214 @@ def predict_fn(input_data: Dict, model_components: Dict) -> Dict:
     if not packages:
         return {'error': 'No packages provided', 'status': 'error'}
     
-    logger.info(f"Processing {len(packages)} packages")
+    logger.info(f"Processing {len(packages)} packages with optimized batch processing")
+    
+    # Always use batch processing for optimal performance
+    return _predict_batch_optimized(packages)
+
+
+def _predict_batch_optimized(packages: List[Dict]) -> Dict:
+    """
+    Optimized batch processing with maximum CPU utilization and last-prediction-only results.
+    """
+    global model, preprocessor, device
+    
+    from torch_geometric.data import Batch
+    
+    logger.info(f"[BATCH] Processing {len(packages)} packages with batch optimization")
+    start_time = time.time()
+    
+    # Step 1: Parallel preprocessing - use max CPU power (CPU count - 1)
+    max_cpu_workers = max(1, multiprocessing.cpu_count() - 1)
+    actual_workers = min(max_cpu_workers, len(packages))
+    
+    logger.info(f"[BATCH] Starting parallel preprocessing with {actual_workers} workers (max available: {max_cpu_workers})")
+    preprocessing_start = time.time()
+    
+    try:
+        # Use threaded batch processing to avoid serialization issues
+        features_list = preprocessor.process_lifecycle_batch_threaded(
+            packages, 
+            return_labels=True,
+            max_workers=actual_workers
+        )
+    except Exception as e:
+        logger.warning(f"[BATCH] Batch preprocessing failed, falling back to sequential: {e}")
+        features_list = []
+        for pkg in packages:
+            try:
+                features = preprocessor.process_lifecycle(pkg, return_labels=True)
+                features_list.append(features)
+            except Exception as pkg_e:
+                logger.error(f"[BATCH] Failed to process {pkg.get('package_id', 'unknown')}: {pkg_e}")
+                features_list.append(None)
+    
+    preprocessing_time = time.time() - preprocessing_start
+    logger.info(f"[BATCH] Preprocessing completed in {preprocessing_time:.3f}s")
+    
+    # Step 2: Convert to PyG graphs and create batch
+    logger.info("[BATCH] Converting to PyG graphs...")
+    conversion_start = time.time()
+    
+    valid_graphs = []
+    valid_indices = []
     results = []
     
-    for i, pkg in enumerate(packages):
+    for i, (pkg, features) in enumerate(zip(packages, features_list)):
         pkg_id = pkg.get('package_id', f'unknown_{i}')
-        logger.info(f"Processing package {i+1}/{len(packages)}: {pkg_id}")
         
-        try:
-            # Process package through preprocessor
-            logger.info(f"[{pkg_id}] Processing features...")
-            features = preprocessor.process_lifecycle(pkg, return_labels=True)
-            
-            if features is None:
-                logger.warning(f"[{pkg_id}] Failed to process features")
-                results.append({
-                    'package_id': pkg_id,
-                    'status': 'error',
-                    'error': 'Failed to process package features'
-                })
-                continue
-            
-            logger.info(f"[{pkg_id}] Features processed, num_nodes: {features.get('num_nodes')}")
-            
-            # Convert to PyG Data
-            logger.info(f"[{pkg_id}] Converting to PyG Data...")
-            graph_data = _features_to_pyg_data(features)
-            graph_data = graph_data.to(device)
-            batch = Batch.from_data_list([graph_data])
-            
-            # Add batch metadata
-            batch.node_counts = torch.tensor([graph_data.num_nodes], dtype=torch.long, device=device)
-            batch.edge_counts = torch.tensor([graph_data.edge_index.shape[1]], dtype=torch.long, device=device)
-            
-            # Run inference
-            logger.info(f"[{pkg_id}] Running inference...")
-            with torch.no_grad():
-                with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
-                    predictions = model(batch)
-            
-            logger.info(f"[{pkg_id}] Inference complete, extracting predictions...")
-            
-            # Extract predictions
-            # Predictions are per-edge (transition times between consecutive events)
-            num_edges = graph_data.edge_index.shape[1]
-            
-            if predictions.dim() > 1:
-                preds = predictions[:num_edges].squeeze(-1)
-            else:
-                preds = predictions[:num_edges]
-            
-            preds_scaled = preds.float().cpu().numpy()
-            preds_hours = preprocessor.inverse_transform_time(preds_scaled).flatten()
-            
-            logger.info(f"[{pkg_id}] Predictions (hours): {preds_hours.tolist()}")
-            
-            # Include ground truth labels if available (for debugging)
-            result_entry = {
-                'package_id': pkg_id,
-                'status': 'success',
-                'predictions_hours': preds_hours.tolist(),
-                'num_transitions': num_edges,
-            }
-            
-            if 'labels_raw' in features and features['labels_raw'] is not None:
-                labels_raw = features['labels_raw'].flatten()
-                result_entry['ground_truth_hours'] = labels_raw.tolist()
-            
-            results.append(result_entry)
-            
-        except Exception as e:
-            logger.error(f"[{pkg_id}] Error: {type(e).__name__}: {e}")
-            import traceback
-            logger.error(f"[{pkg_id}] Traceback: {traceback.format_exc()}")
+        if features is None:
             results.append({
                 'package_id': pkg_id,
                 'status': 'error',
-                'error': str(e)
+                'error': 'Failed to process package features'
+            })
+            continue
+        
+        try:
+            graph_data = _features_to_pyg_data(features)
+            graph_data.pkg_id = pkg_id  # Store package ID for later reference
+            graph_data.pkg_index = i
+            valid_graphs.append(graph_data)
+            valid_indices.append(i)
+            
+            # Add placeholder result that will be updated
+            results.append({
+                'package_id': pkg_id,
+                'status': 'pending'
+            })
+            
+        except Exception as e:
+            logger.error(f"[BATCH] Failed to convert {pkg_id} to PyG: {e}")
+            results.append({
+                'package_id': pkg_id,
+                'status': 'error',
+                'error': f'Failed to convert to graph: {str(e)}'
             })
     
-    logger.info(f"Completed processing, {len(results)} results")
+    if not valid_graphs:
+        logger.warning("[BATCH] No valid graphs to process")
+        return {'status': 'success', 'results': results}
+    
+    conversion_time = time.time() - conversion_start
+    logger.info(f"[BATCH] Graph conversion completed in {conversion_time:.3f}s, {len(valid_graphs)} valid graphs")
+    
+    # Step 3: Batch inference
+    logger.info("[BATCH] Running batch inference...")
+    inference_start = time.time()
+    
+    try:
+        # Move all graphs to device and create batch
+        device_graphs = [graph.to(device) for graph in valid_graphs]
+        batch = Batch.from_data_list(device_graphs)
+        
+        # Add batch metadata
+        node_counts = [graph.num_nodes for graph in device_graphs]
+        edge_counts = [graph.edge_index.shape[1] for graph in device_graphs]
+        
+        batch.node_counts = torch.tensor(node_counts, dtype=torch.long, device=device)
+        batch.edge_counts = torch.tensor(edge_counts, dtype=torch.long, device=device)
+        
+        # Run inference with automatic mixed precision
+        with torch.no_grad():
+            with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+                predictions = model(batch)
+        
+        inference_time = time.time() - inference_start
+        logger.info(f"[BATCH] Batch inference completed in {inference_time:.3f}s")
+        
+        # Step 4: Extract LAST prediction per package (next unhappened event)
+        logger.info("[BATCH] Extracting last predictions per package...")
+        extraction_start = time.time()
+        
+        edge_offset = 0
+        
+        for graph_idx, (graph, pkg_idx) in enumerate(zip(device_graphs, valid_indices)):
+            pkg_id = graph.pkg_id
+            num_edges = edge_counts[graph_idx]
+            
+            if num_edges > 0:
+                # Extract all predictions for this package
+                pkg_predictions = predictions[edge_offset:edge_offset + num_edges]
+                
+                if pkg_predictions.dim() > 1:
+                    preds = pkg_predictions.squeeze(-1)
+                else:
+                    preds = pkg_predictions
+                
+                preds_scaled = preds.float().cpu().numpy()
+                preds_hours = preprocessor.inverse_transform_time(preds_scaled).flatten()
+                
+                # OPTIMIZATION: Only return the LAST prediction (next unhappened event)
+                last_prediction = float(preds_hours[-1]) if len(preds_hours) > 0 else None
+                
+                # Update result with last prediction only
+                results[pkg_idx] = {
+                    'package_id': pkg_id,
+                    'status': 'success',
+                    'next_event_prediction_hours': last_prediction,
+                    'total_transitions': num_edges,
+                }
+                
+                # Add ground truth for the last transition if available (for debugging)
+                features = features_list[pkg_idx]
+                if features and 'labels_raw' in features and features['labels_raw'] is not None:
+                    labels_raw = features['labels_raw'].flatten()
+                    if len(labels_raw) > 0:
+                        results[pkg_idx]['ground_truth_last_transition_hours'] = float(labels_raw[-1])
+                
+            else:
+                results[pkg_idx] = {
+                    'package_id': pkg_id,
+                    'status': 'success',
+                    'next_event_prediction_hours': None,
+                    'total_transitions': 0,
+                }
+            
+            edge_offset += num_edges
+        
+        extraction_time = time.time() - extraction_start
+        total_time = time.time() - start_time
+        
+        logger.info(f"[BATCH] Result extraction completed in {extraction_time:.3f}s")
+        logger.info(f"[BATCH] Total batch processing time: {total_time:.3f}s")
+        logger.info(f"[BATCH] Performance breakdown:")
+        logger.info(f"  - Preprocessing: {preprocessing_time:.3f}s ({preprocessing_time/total_time*100:.1f}%)")
+        logger.info(f"  - Graph conversion: {conversion_time:.3f}s ({conversion_time/total_time*100:.1f}%)")
+        logger.info(f"  - Batch inference: {inference_time:.3f}s ({inference_time/total_time*100:.1f}%)")
+        logger.info(f"  - Result extraction: {extraction_time:.3f}s ({extraction_time/total_time*100:.1f}%)")
+        
+    except Exception as e:
+        logger.error(f"[BATCH] Batch inference failed: {e}")
+        import traceback
+        logger.error(f"[BATCH] Traceback: {traceback.format_exc()}")
+        
+        # Update all pending results to error
+        for i, result in enumerate(results):
+            if result.get('status') == 'pending':
+                results[i] = {
+                    'package_id': result['package_id'],
+                    'status': 'error',
+                    'error': f'Batch inference failed: {str(e)}'
+                }
+    
+    success_count = sum(1 for r in results if r.get('status') == 'success')
+    logger.info(f"[BATCH] Completed: {success_count}/{len(results)} successful")
     
     return {
         'status': 'success',
-        'results': results
+        'results': results,
+        'batch_stats': {
+            'total_packages': len(packages),
+            'successful': success_count,
+            'failed': len(results) - success_count,
+            'workers_used': actual_workers,
+            'max_workers_available': max_cpu_workers,
+            'preprocessing_time': preprocessing_time,
+            'inference_time': inference_time if 'inference_time' in locals() else 0,
+            'total_time': time.time() - start_time,
+            'optimization': 'last_prediction_only'
+        }
     }
 
 
