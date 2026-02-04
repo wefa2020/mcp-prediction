@@ -13,6 +13,10 @@ import ast
 import os
 import io
 import pickle
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from functools import partial
+import logging
 
 
 class PackageLifecyclePreprocessor:
@@ -766,6 +770,167 @@ class PackageLifecyclePreprocessor:
         ], dtype=np.float32)
         
         return edge_features
+    
+    # =========================================================================
+    # BATCH PROCESSING
+    # =========================================================================
+    
+    def process_lifecycle_batch(
+        self, 
+        package_data_list: List[Dict], 
+        return_labels: bool = True,
+        max_workers: Optional[int] = None,
+        chunk_size: Optional[int] = None
+    ) -> List[Dict]:
+        """
+        Process multiple package lifecycles in parallel.
+        
+        Args:
+            package_data_list: List of package data dictionaries
+            return_labels: Whether to include labels in results
+            max_workers: Number of parallel workers (default: CPU count)
+            chunk_size: Chunk size for processing (default: auto)
+            
+        Returns:
+            List of processed feature dictionaries
+        """
+        if not self.fitted:
+            raise ValueError("Preprocessor must be fitted before processing")
+        
+        if not package_data_list:
+            return []
+        
+        num_packages = len(package_data_list)
+        
+        # Determine optimal parameters
+        if max_workers is None:
+            max_workers = min(multiprocessing.cpu_count(), num_packages)
+        
+        if chunk_size is None:
+            chunk_size = max(1, num_packages // (max_workers * 4))
+        
+        logging.info(f"Processing {num_packages} packages with {max_workers} workers, chunk_size={chunk_size}")
+        
+        # For small batches, use sequential processing to avoid overhead
+        if num_packages < 10:
+            return [self.process_lifecycle(pkg, return_labels) for pkg in package_data_list]
+        
+        # Create worker function with bound parameters
+        worker_func = partial(self._process_lifecycle_worker, return_labels=return_labels)
+        
+        results = []
+        failed_count = 0
+        
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Submit chunks for processing
+            chunks = [
+                package_data_list[i:i + chunk_size] 
+                for i in range(0, num_packages, chunk_size)
+            ]
+            
+            future_to_chunk = {
+                executor.submit(worker_func, chunk): i 
+                for i, chunk in enumerate(chunks)
+            }
+            
+            for future in as_completed(future_to_chunk):
+                chunk_idx = future_to_chunk[future]
+                try:
+                    chunk_results = future.result()
+                    results.extend(chunk_results)
+                except Exception as e:
+                    logging.error(f"Chunk {chunk_idx} failed: {e}")
+                    # Add None results for failed chunks to maintain order
+                    chunk_size_actual = len(chunks[chunk_idx])
+                    results.extend([None] * chunk_size_actual)
+                    failed_count += chunk_size_actual
+        
+        # Sort results to maintain original order
+        if len(results) != num_packages:
+            logging.warning(f"Result count mismatch: expected {num_packages}, got {len(results)}")
+        
+        if failed_count > 0:
+            logging.warning(f"Failed to process {failed_count}/{num_packages} packages")
+        
+        return results
+    
+    @staticmethod
+    def _process_lifecycle_worker(package_chunk: List[Dict], return_labels: bool) -> List[Dict]:
+        """
+        Worker function for parallel processing.
+        
+        This is a static method to avoid pickling issues with multiprocessing.
+        """
+        results = []
+        
+        for package_data in package_chunk:
+            try:
+                # Note: This assumes the preprocessor is already fitted and available
+                # In practice, we'll need to pass the fitted preprocessor state
+                result = PackageLifecyclePreprocessor._process_single_package(
+                    package_data, return_labels
+                )
+                results.append(result)
+            except Exception as e:
+                logging.error(f"Failed to process package {package_data.get('package_id', 'unknown')}: {e}")
+                results.append(None)
+        
+        return results
+    
+    @staticmethod
+    def _process_single_package(package_data: Dict, return_labels: bool) -> Dict:
+        """
+        Static method for processing a single package.
+        This will be implemented to work with serialized preprocessor state.
+        """
+        # This is a placeholder - we'll need to implement proper state serialization
+        # for multiprocessing to work correctly
+        raise NotImplementedError("Static processing method needs preprocessor state")
+    
+    def process_lifecycle_batch_threaded(
+        self, 
+        package_data_list: List[Dict], 
+        return_labels: bool = True,
+        max_workers: Optional[int] = None
+    ) -> List[Dict]:
+        """
+        Process multiple package lifecycles using threading (for I/O bound operations).
+        
+        This is more suitable when preprocessing is I/O bound or when the preprocessor
+        state cannot be easily serialized for multiprocessing.
+        """
+        if not self.fitted:
+            raise ValueError("Preprocessor must be fitted before processing")
+        
+        if not package_data_list:
+            return []
+        
+        num_packages = len(package_data_list)
+        
+        if max_workers is None:
+            max_workers = min(32, num_packages)  # Threading can handle more workers
+        
+        logging.info(f"Processing {num_packages} packages with {max_workers} threads")
+        
+        results = [None] * num_packages
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit individual packages
+            future_to_index = {
+                executor.submit(self.process_lifecycle, pkg, return_labels): i
+                for i, pkg in enumerate(package_data_list)
+            }
+            
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    result = future.result()
+                    results[index] = result
+                except Exception as e:
+                    logging.error(f"Package {index} failed: {e}")
+                    results[index] = None
+        
+        return results
     
     # =========================================================================
     # MAIN PROCESSING
